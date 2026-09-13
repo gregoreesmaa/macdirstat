@@ -213,6 +213,10 @@ mod tests {
         base
     }
 
+    // FileTree::scan drains thread-local extension maps via a rayon broadcast,
+    // so concurrent scans in one process can swap entries: serialize scans.
+    static SCAN_LOCK: Mutex<()> = Mutex::new(());
+
     /// Scanning must not follow symlinks: a symlink to a dir stays a childless
     /// file node, its target is counted once, and a self-loop terminates.
     #[test]
@@ -224,6 +228,7 @@ mod tests {
         symlink("real/file.txt", base.join("link_to_file")).unwrap();
         symlink("loop", base.join("loop")).unwrap();
 
+        let _guard = SCAN_LOCK.lock().expect("scan lock");
         let tree = FileTree::scan(&base);
 
         let find = |name: &str| {
@@ -288,6 +293,7 @@ mod tests {
         std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
         std::fs::write(base.join("b/file.txt"), vec![b'y'; 512]).unwrap();
 
+        let _guard = SCAN_LOCK.lock().expect("scan lock");
         let tree = FileTree::scan(&base);
 
         let find = |name: &str| {
@@ -304,6 +310,13 @@ mod tests {
         assert_eq!(b.children.len(), 1);
         assert_eq!(tree.root.dir_count, 3, "root + a + b");
         assert_eq!(tree.root.file_count, 2, "one file per dir");
+        // Extension stats drain into the tree: both txt files, summed.
+        let txt = tree
+            .extensions
+            .iter()
+            .find(|(ext, _)| &**ext == "txt")
+            .map(|(_, n)| *n);
+        assert_eq!(txt, Some(a.size + b.size));
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -346,6 +359,10 @@ mod tests {
         assert!(is_mirror_in_scan("System/Library/Caches", &sys));
         assert!(is_mirror_in_scan("System/Library/Caches/x", &sys));
         assert!(!is_mirror_in_scan("usr/local", &sys));
+
+        // Canonical boundary even when the target matches textually.
+        let user = ctx_for("/user");
+        assert!(!is_mirror_in_scan("Users", &user));
 
         // Empty table prunes nothing.
         let empty = ScanCtx {
@@ -433,19 +450,22 @@ mod tests {
     #[test]
     fn parse_firmlinks_edges() {
         let pairs = parse_firmlinks(
-            "# comment\n\nUsers\tUsers\nopt/\t/opt/\nUSERS2\tUSERS2\n\
+            "# comment\n\nUsers\tUsers\nopt/\t/opt/\nUSERS2\tUSERS2\nCanonDir\tTargetName\n\
              bad-line-no-tab\nempty-target\t\n\t\nSystem/Library/Caches\tSystem/Library/Caches\n",
         );
         assert_eq!(pairs.get("Users"), Some(&"/users".into()));
         assert_eq!(pairs.get("opt"), Some(&"/opt".into()));
         assert_eq!(pairs.get("USERS2"), Some(&"/users2".into()));
+        // Asymmetric pair pins column order: target keys, canonical values.
+        assert_eq!(pairs.get("TargetName"), Some(&"/canondir".into()));
+        assert!(!pairs.keys().any(|k| &**k == "CanonDir"));
         assert_eq!(
             pairs.get("System/Library/Caches"),
             Some(&"/system/library/caches".into())
         );
         assert!(!pairs.keys().any(|k| &**k == "bad-line-no-tab"));
         assert!(!pairs.keys().any(|k| &**k == "empty-target"));
-        assert_eq!(pairs.len(), 4);
+        assert_eq!(pairs.len(), 5);
         assert!(parse_firmlinks("").is_empty());
     }
 
@@ -453,6 +473,7 @@ mod tests {
     #[test]
     fn firmlink_table_loads() {
         if !std::path::Path::new("/usr/share/firmlinks").exists() {
+            eprintln!("skipping firmlink table test: not macOS");
             return; // not macOS — nothing to parse
         }
         let pairs = load_firmlinks();
@@ -500,6 +521,7 @@ mod tests {
     #[test]
     fn scan_of_missing_root_is_empty() {
         let missing = temp_base("missing-test").join("nope");
+        let _guard = SCAN_LOCK.lock().expect("scan lock");
         let tree = FileTree::scan(&missing);
         assert!(tree.root.children.is_empty());
         assert_eq!(tree.root.size, 0);
@@ -512,16 +534,28 @@ mod tests {
     #[test]
     fn scan_tolerates_unreadable_subdir() {
         if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipping unreadable-subdir test: running as root");
             return; // root reads anything; permission bit is no barrier
         }
+        // Restores access on drop so cleanup works even if an assert panics.
+        struct RestorePerms<'a> {
+            path: &'a std::path::Path,
+        }
+        impl Drop for RestorePerms<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(0o755));
+            }
+        }
         let base = temp_base("unreadable-test");
-        std::fs::create_dir_all(base.join("locked")).unwrap();
+        let locked_path = base.join("locked");
+        std::fs::create_dir_all(&locked_path).unwrap();
         std::fs::create_dir_all(base.join("open")).unwrap();
-        std::fs::write(base.join("locked/file.txt"), vec![b'x'; 512]).unwrap();
+        std::fs::write(locked_path.join("file.txt"), vec![b'x'; 512]).unwrap();
         std::fs::write(base.join("open/file.txt"), vec![b'y'; 512]).unwrap();
-        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o000))
-            .unwrap();
+        std::fs::set_permissions(&locked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = RestorePerms { path: &locked_path };
 
+        let _guard = SCAN_LOCK.lock().expect("scan lock");
         let tree = FileTree::scan(&base);
 
         let find = |name: &str| {
@@ -536,8 +570,50 @@ mod tests {
         assert_eq!(find("open").children.len(), 1);
         assert_eq!(tree.root.file_count, 1, "only the readable file counts");
 
-        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Data-relative path tracking: the Data root itself, plain join,
+    /// empty-parent join, and the outside-Data case.
+    #[test]
+    fn child_data_rel_tracking() {
+        let ctx = ScanCtx {
+            visited: VisitedDirs::default(),
+            firmlinks: HashMap::new(),
+            data_root: Some((9, 9)),
+            scan_root: "/".into(),
+        };
+        assert_eq!(
+            child_data_rel("x", Some((9, 9)), None, &ctx),
+            Some(String::new())
+        );
+        assert_eq!(child_data_rel("x", Some((1, 2)), None, &ctx), None);
+        assert_eq!(
+            child_data_rel("c", Some((1, 2)), Some("a/b"), &ctx),
+            Some("a/b/c".into())
+        );
+        assert_eq!(
+            child_data_rel("c", Some((1, 2)), Some(""), &ctx),
+            Some("c".into())
+        );
+    }
+
+    /// An explicitly scanned root may be a symlink: open_dir follows it
+    /// while traversal below still refuses links.
+    #[test]
+    fn scan_through_symlinked_root() {
+        let base = temp_base("symlink-root-test");
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        std::fs::write(base.join("real/file.txt"), vec![b'x'; 512]).unwrap();
+        symlink("real", base.join("linkroot")).unwrap();
+
+        let _guard = SCAN_LOCK.lock().expect("scan lock");
+        let tree = FileTree::scan(&base.join("linkroot"));
+
+        assert_eq!(tree.root.children.len(), 1);
+        assert_eq!(&*tree.root.children[0].name, "file.txt");
+        assert_eq!(tree.root.file_count, 1);
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }
@@ -634,7 +710,8 @@ fn is_mirror_in_scan(rel: &str, ctx: &ScanCtx) -> bool {
     loop {
         if let Some(canon) = ctx.firmlinks.get(prefix) {
             let canon: &str = canon;
-            // Component-wise containment; exact inputs keep this exact.
+            // Byte comparison is exact because both sides arrive canonicalized
+            // and lowercased; the length check keeps "/users2" off "/users".
             if root == "/"
                 || canon == root
                 || (canon.len() > root.len()
