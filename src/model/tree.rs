@@ -283,9 +283,6 @@ fn load_firmlinks() -> HashMap<Box<str>, Box<str>> {
 /// view in this scan, so skipping it would lose content. Any matching target
 /// counts, from `rel` itself up through its parents.
 fn is_mirror_in_scan(rel: &str, ctx: &ScanCtx) -> bool {
-    if ctx.firmlinks.is_empty() {
-        return false;
-    }
     let root: &str = &ctx.scan_root;
     let mut prefix = rel;
     loop {
@@ -624,29 +621,23 @@ mod tests {
         assert_eq!(b.children.len(), 1);
         assert_eq!(tree.root.dir_count, 3, "root + a + b");
         assert_eq!(tree.root.file_count, 4, "one file per dir + top-level");
-        // Extension stats drain into the tree: both txt files, summed.
-        let txt = tree
-            .extensions
-            .iter()
-            .find(|(ext, _)| &**ext == "txt")
-            .map(|(_, n)| *n);
-        assert_eq!(txt, Some(a.size + b.size));
-        // Root-level files are recorded on the scan thread, so this pins the
-        // main-thread drain arm (deleting it drops the md entry silently).
-        let md = tree
-            .extensions
-            .iter()
-            .find(|(ext, _)| &**ext == "md")
-            .map(|(_, n)| *n);
-        assert_eq!(md, Some(256));
-        // The extensionless file must land in the "(no ext)" bucket on both
-        // the scan path and the rebuild path (pins ext_bucket's sentinel
-        // mapping at both call sites).
         fn bucket(exts: &[(Box<str>, u64)], name: &str) -> Option<u64> {
             exts.iter().find(|(ext, _)| &**ext == name).map(|(_, n)| *n)
         }
+        // Extension stats drain into the tree: both txt files, summed.
+        // (Snapshot the sum: a/b borrow tree, blocking the &mut rebuild below.)
+        let txt_total = a.size + b.size;
+        assert_eq!(bucket(&tree.extensions, "txt"), Some(txt_total));
+        // Root-level files are recorded on the scan thread, so this pins the
+        // main-thread drain arm (deleting it drops the md entry silently).
+        assert_eq!(bucket(&tree.extensions, "md"), Some(256));
+        // The extensionless file must land in the "(no ext)" bucket on both
+        // the scan path and the rebuild path (pins ext_bucket's sentinel
+        // mapping at both call sites).
         assert_eq!(bucket(&tree.extensions, "(no ext)"), Some(128));
         tree.rebuild_extensions();
+        assert_eq!(bucket(&tree.extensions, "txt"), Some(txt_total));
+        assert_eq!(bucket(&tree.extensions, "md"), Some(256));
         assert_eq!(bucket(&tree.extensions, "(no ext)"), Some(128));
 
         let _ = std::fs::remove_dir_all(&base);
