@@ -204,20 +204,24 @@ fn collect_extensions(node: &FileNode, map: &mut HashMap<Box<str>, u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    // Fresh temp fixture dir (removing any stale one).
+    fn temp_base(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("macdirstat-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        base
+    }
 
     /// Scanning must not follow symlinks: a symlink to a dir stays a childless
     /// file node, its target is counted once, and a self-loop terminates.
     #[test]
     fn scan_does_not_follow_symlinks() {
-        let base = std::env::temp_dir().join(format!(
-            "macdirstat-symlink-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = temp_base("symlink-test");
         std::fs::create_dir_all(base.join("real")).unwrap();
         std::fs::write(base.join("real/file.txt"), vec![b'x'; 1024]).unwrap();
         symlink("real", base.join("link_to_real")).unwrap();
+        symlink("real/file.txt", base.join("link_to_file")).unwrap();
         symlink("loop", base.join("loop")).unwrap();
 
         let tree = FileTree::scan(&base);
@@ -232,6 +236,10 @@ mod tests {
         let link = find("link_to_real");
         assert!(!link.is_dir, "symlink to a dir must not be a dir node");
         assert!(link.children.is_empty());
+        let lf = find("link_to_file");
+        assert!(!lf.is_dir, "symlink to a file must not be a dir node");
+        assert!(lf.children.is_empty());
+        assert!(lf.size < find("real").size, "file link reports link size");
         let lp = find("loop");
         assert!(!lp.is_dir, "symlink loop must not be a dir node");
         let real = find("real");
@@ -243,6 +251,7 @@ mod tests {
         );
         let sum: u64 = tree.root.children.iter().map(|c| c.size).sum();
         assert_eq!(tree.root.size, sum, "target must be counted once");
+        assert_eq!(tree.root.file_count, 4, "real file + 3 links");
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -251,11 +260,7 @@ mod tests {
     /// the second claim must be rejected so its contents aren't counted twice.
     #[test]
     fn claim_dir_rejects_second_fd_to_same_dir() {
-        let base = std::env::temp_dir().join(format!(
-            "macdirstat-visited-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = temp_base("visited-test");
         std::fs::create_dir_all(&base).unwrap();
 
         let visited = VisitedDirs::default();
@@ -277,11 +282,7 @@ mod tests {
     /// Distinct directories must never be pruned: no false-positive dedup.
     #[test]
     fn scan_keeps_distinct_directories() {
-        let base = std::env::temp_dir().join(format!(
-            "macdirstat-distinct-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = temp_base("distinct-test");
         std::fs::create_dir_all(base.join("a")).unwrap();
         std::fs::create_dir_all(base.join("b")).unwrap();
         std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
@@ -309,14 +310,18 @@ mod tests {
 
     /// Mirror pruning: exact targets and anything beneath them are skipped
     /// when the canonical is in the scan; siblings, lookalike prefixes, and
-    /// mirrors whose canonical is outside the scan are kept.
+    /// mirrors whose canonical is outside the scan are kept. Containment is
+    /// component-wise: `/users2` is not under `/users`.
     #[test]
     fn firmlink_mirror_matching() {
         let ctx_for = |root: &str| ScanCtx {
             visited: VisitedDirs::default(),
             firmlinks: [
                 ("Users".into(), "/users".into()),
-                ("System/Library/Caches".into(), "/system/library/caches".into()),
+                (
+                    "System/Library/Caches".into(),
+                    "/system/library/caches".into(),
+                ),
                 ("usr/local".into(), "/usr/local".into()),
             ]
             .into_iter()
@@ -325,33 +330,31 @@ mod tests {
             scan_root: root.into(),
         };
         let root = ctx_for("/");
-        assert!(mirror_in_scan("Users", &root));
-        assert!(mirror_in_scan("Users/gregoreesmaa", &root));
-        assert!(mirror_in_scan("System/Library/Caches", &root));
-        assert!(!mirror_in_scan("System/Library", &root));
-        assert!(!mirror_in_scan("System", &root));
-        assert!(!mirror_in_scan("Users2", &root));
-        assert!(!mirror_in_scan("Applications", &root));
-        assert!(!mirror_in_scan("usr/libexec", &root));
-        assert!(mirror_in_scan("usr/local/bin", &root));
+        assert!(is_mirror_in_scan("Users", &root));
+        assert!(is_mirror_in_scan("Users/gregoreesmaa", &root));
+        assert!(is_mirror_in_scan("System/Library/Caches", &root));
+        assert!(!is_mirror_in_scan("System/Library", &root));
+        assert!(!is_mirror_in_scan("System", &root));
+        assert!(!is_mirror_in_scan("Users2", &root));
+        assert!(!is_mirror_in_scan("Applications", &root));
+        assert!(!is_mirror_in_scan("usr/libexec", &root));
+        assert!(is_mirror_in_scan("usr/local/bin", &root));
 
         // Same mirrors, narrower scan: canonicals outside are kept.
         let sys = ctx_for("/system");
-        assert!(!mirror_in_scan("Users", &sys));
-        assert!(mirror_in_scan("System/Library/Caches", &sys));
-        assert!(!mirror_in_scan("usr/local", &sys));
-    }
+        assert!(!is_mirror_in_scan("Users", &sys));
+        assert!(is_mirror_in_scan("System/Library/Caches", &sys));
+        assert!(is_mirror_in_scan("System/Library/Caches/x", &sys));
+        assert!(!is_mirror_in_scan("usr/local", &sys));
 
-    /// Containment is component-wise: `/xy` is not under `/x`.
-    #[test]
-    fn under_root_matching() {
-        assert!(under_root("/users", "/"));
-        assert!(under_root("/users", "/users"));
-        assert!(under_root("/users/gregoreesmaa", "/users"));
-        assert!(under_root("/system/library/caches", "/system"));
-        assert!(!under_root("/users2", "/users"));
-        assert!(!under_root("/users", "/system"));
-        assert!(!under_root("/system", "/system/library"));
+        // Empty table prunes nothing.
+        let empty = ScanCtx {
+            visited: VisitedDirs::default(),
+            firmlinks: HashMap::new(),
+            data_root: None,
+            scan_root: "/".into(),
+        };
+        assert!(!is_mirror_in_scan("Users", &empty));
     }
 
     /// End-to-end prune through real traversal: with a synthetic ctx treating
@@ -359,11 +362,7 @@ mod tests {
     /// canonical is in the scan, `a` disappears while sibling `b` scans normally.
     #[test]
     fn firmlink_mirror_subtree_is_skipped() {
-        let base = std::env::temp_dir().join(format!(
-            "macdirstat-mirror-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = temp_base("mirror-test");
         std::fs::create_dir_all(base.join("a")).unwrap();
         std::fs::create_dir_all(base.join("b")).unwrap();
         std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
@@ -387,6 +386,13 @@ mod tests {
         assert_eq!(node.children.len(), 1);
         assert_eq!(&*node.children[0].name, "b");
         assert_eq!(node.children[0].children.len(), 1);
+        assert_eq!(node.file_count, 1, "only b's file is counted");
+        // The pruned mirror is skipped before claiming: only b is visited,
+        // and a's identity stays claimable.
+        assert_eq!(ctx.visited.lock().expect("visited").len(), 1);
+        let a_fd = getattrlistbulk::open_dir(&base.join("a"));
+        assert!(claim_ident(dir_ident(a_fd), &ctx.visited));
+        getattrlistbulk::close_dir(a_fd);
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -395,11 +401,7 @@ mod tests {
     /// the mirror is the only view, so it must be kept (no undercount).
     #[test]
     fn firmlink_mirror_kept_when_canonical_outside_scan() {
-        let base = std::env::temp_dir().join(format!(
-            "macdirstat-mirror-kept-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = temp_base("mirror-kept-test");
         std::fs::create_dir_all(base.join("a")).unwrap();
         std::fs::create_dir_all(base.join("b")).unwrap();
         std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
@@ -411,9 +413,7 @@ mod tests {
         getattrlistbulk::close_dir(base_fd);
         let ctx = ScanCtx {
             visited: VisitedDirs::default(),
-            firmlinks: [("a".into(), "/elsewhere/a".into())]
-                .into_iter()
-                .collect(),
+            firmlinks: [("a".into(), "/elsewhere/a".into())].into_iter().collect(),
             data_root: base_id,
             scan_root: "/base".into(),
         };
@@ -423,8 +423,30 @@ mod tests {
 
         assert_eq!(node.children.len(), 2);
         assert_eq!(node.dir_count, 3, "root + a + b");
+        assert_eq!(node.file_count, 2, "both files are counted");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The firmlink parser skips blanks, comments, and malformed lines,
+    /// trims slashes, and lowercases canonicals.
+    #[test]
+    fn parse_firmlinks_edges() {
+        let pairs = parse_firmlinks(
+            "# comment\n\nUsers\tUsers\nopt/\t/opt/\nUSERS2\tUSERS2\n\
+             bad-line-no-tab\nempty-target\t\n\t\nSystem/Library/Caches\tSystem/Library/Caches\n",
+        );
+        assert_eq!(pairs.get("Users"), Some(&"/users".into()));
+        assert_eq!(pairs.get("opt"), Some(&"/opt".into()));
+        assert_eq!(pairs.get("USERS2"), Some(&"/users2".into()));
+        assert_eq!(
+            pairs.get("System/Library/Caches"),
+            Some(&"/system/library/caches".into())
+        );
+        assert!(!pairs.keys().any(|k| &**k == "bad-line-no-tab"));
+        assert!(!pairs.keys().any(|k| &**k == "empty-target"));
+        assert_eq!(pairs.len(), 4);
+        assert!(parse_firmlinks("").is_empty());
     }
 
     /// The real firmlink table parses to the expected pairs (macOS only).
@@ -434,16 +456,89 @@ mod tests {
             return; // not macOS — nothing to parse
         }
         let pairs = load_firmlinks();
-        assert_eq!(pairs.get("Users").map(String::as_str), Some("/users"));
+        assert_eq!(pairs.get("Users"), Some(&"/users".into()));
         assert_eq!(
-            pairs.get("System/Library/Caches").map(String::as_str),
-            Some("/system/library/caches")
+            pairs.get("System/Library/Caches"),
+            Some(&"/system/library/caches".into())
         );
         for (target, canon) in pairs.iter() {
             assert!(!target.is_empty());
             assert!(!target.starts_with('/'));
             assert!(canon.starts_with('/'), "canonical must be absolute");
         }
+    }
+
+    /// Scan-context wiring: the root is canonicalized once, and the Data
+    /// identity is tracked exactly when the table loaded.
+    #[test]
+    fn scan_ctx_wiring() {
+        let base = temp_base("ctx-test");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let ctx = make_scan_ctx(&base);
+        let expect = std::fs::canonicalize(&base)
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase();
+        assert_eq!(&*ctx.scan_root, expect.as_str());
+        assert_eq!(ctx.data_root.is_some(), !ctx.firmlinks.is_empty());
+
+        // Root==Data marks the root rel; anything else leaves it unset.
+        assert_eq!(
+            root_data_rel(Some((7, 7)), Some((7, 7))),
+            Some(String::new())
+        );
+        assert_eq!(root_data_rel(Some((7, 7)), Some((8, 8))), None);
+        assert_eq!(root_data_rel(None, Some((7, 7))), None);
+        assert_eq!(root_data_rel(Some((7, 7)), None), None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Scanning a missing root yields an empty tree, not a panic.
+    /// (Unreadable subtrees behave the same: empty dir node, kept in place.)
+    #[test]
+    fn scan_of_missing_root_is_empty() {
+        let missing = temp_base("missing-test").join("nope");
+        let tree = FileTree::scan(&missing);
+        assert!(tree.root.children.is_empty());
+        assert_eq!(tree.root.size, 0);
+        assert_eq!(tree.root.file_count, 0);
+        assert_eq!(tree.root.dir_count, 1);
+    }
+
+    /// An unreadable subdir scans as an empty dir without panicking.
+    /// (Unreadable content stays visible in place — never silently dropped.)
+    #[test]
+    fn scan_tolerates_unreadable_subdir() {
+        if unsafe { libc::getuid() } == 0 {
+            return; // root reads anything; permission bit is no barrier
+        }
+        let base = temp_base("unreadable-test");
+        std::fs::create_dir_all(base.join("locked")).unwrap();
+        std::fs::create_dir_all(base.join("open")).unwrap();
+        std::fs::write(base.join("locked/file.txt"), vec![b'x'; 512]).unwrap();
+        std::fs::write(base.join("open/file.txt"), vec![b'y'; 512]).unwrap();
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+
+        let tree = FileTree::scan(&base);
+
+        let find = |name: &str| {
+            tree.root
+                .children
+                .iter()
+                .find(|c| &*c.name == name)
+                .unwrap_or_else(|| panic!("missing child {name}"))
+        };
+        let locked = find("locked");
+        assert!(locked.is_dir && locked.children.is_empty());
+        assert_eq!(find("open").children.len(), 1);
+        assert_eq!(tree.root.file_count, 1, "only the readable file counts");
+
+        std::fs::set_permissions(base.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
@@ -459,11 +554,11 @@ struct ScanCtx {
     /// Firmlink table: Data-relative target -> lowercased canonical absolute
     /// path (e.g. `Users` -> `/users`). Empty when the table is unreadable,
     /// in which case only `visited` applies.
-    firmlinks: HashMap<Box<str>, String>,
+    firmlinks: HashMap<Box<str>, Box<str>>,
     /// (dev, ino) of `/System/Volumes/Data`, or None when `firmlinks` is empty.
     data_root: Option<(u64, u64)>,
     /// Lowercased canonicalized scan root, for containment checks.
-    scan_root: String,
+    scan_root: Box<str>,
 }
 
 /// (dev, ino) identity of an open directory fd, or None if it can't be stated.
@@ -486,65 +581,128 @@ fn claim_ident(ident: Option<(u64, u64)>, visited: &VisitedDirs) -> bool {
         Some(key) => visited
             .lock()
             .map(|mut guard| guard.insert(key))
-            .unwrap_or(true),
+            .unwrap_or_else(|e| e.into_inner().insert(key)),
     }
 }
 
-/// Load firmlink pairs (Data-relative target -> lowercased canonical absolute
-/// path) from the system table. Returns an empty map when unreadable.
-fn load_firmlinks() -> HashMap<Box<str>, String> {
+/// Parse firmlink pairs (Data-relative target -> lowercased canonical absolute
+/// path) from the text of the system table. Skips blanks, comments, and
+/// malformed lines.
+fn parse_firmlinks(text: &str) -> HashMap<Box<str>, Box<str>> {
     let mut map = HashMap::new();
-    let Ok(text) = std::fs::read_to_string("/usr/share/firmlinks") else {
-        return map;
-    };
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((canonical, target)) = line.split_once('\t') {
-            let target = target.trim().trim_matches('/');
-            let canonical = canonical.trim().trim_matches('/');
-            if target.is_empty() || canonical.is_empty() {
-                continue;
-            }
-            map.insert(target.into(), format!("/{}", canonical.to_lowercase()));
+        let Some((canonical, target)) = line.split_once('\t') else {
+            continue;
+        };
+        let target = target.trim().trim_matches('/');
+        let canonical = canonical.trim().trim_matches('/');
+        if target.is_empty() || canonical.is_empty() {
+            continue;
         }
+        map.insert(
+            target.into(),
+            format!("/{}", canonical.to_lowercase()).into(),
+        );
     }
     map
 }
 
-/// Component-wise `canon.starts_with(root)` on lowercased absolute paths.
-/// A wrong answer only falls back to visited-set dedup, never to a wrong total.
-fn under_root(canon: &str, root: &str) -> bool {
-    if root == "/" {
-        return true; // canonicals are absolute
+/// Load firmlink pairs from the system table. Empty map when unreadable.
+fn load_firmlinks() -> HashMap<Box<str>, Box<str>> {
+    match std::fs::read_to_string("/usr/share/firmlinks") {
+        Ok(text) => parse_firmlinks(&text),
+        Err(_) => HashMap::new(),
     }
-    canon == root
-        || (canon.len() > root.len()
-            && canon.starts_with(root)
-            && canon.as_bytes()[root.len()] == b'/')
 }
 
 /// Whether the Data-relative path `rel` (e.g. `Users/gregoreesmaa`) is a mirror
 /// whose canonical path is also being scanned (i.e. under the scan root).
 /// Then the canonical view covers it and it can be skipped — deterministically.
 /// When the canonical is outside the scan, the mirror is kept: it is the only
-/// view in this scan, so skipping it would lose content.
-fn mirror_in_scan(rel: &str, ctx: &ScanCtx) -> bool {
+/// view in this scan, so skipping it would lose content. Any matching target
+/// counts, from `rel` itself up through its parents.
+fn is_mirror_in_scan(rel: &str, ctx: &ScanCtx) -> bool {
     if ctx.firmlinks.is_empty() {
         return false;
     }
-    // Longest match first: walk rel, then its parents.
+    let root: &str = &ctx.scan_root;
     let mut prefix = rel;
     loop {
         if let Some(canon) = ctx.firmlinks.get(prefix) {
-            return under_root(canon, &ctx.scan_root);
+            let canon: &str = canon;
+            // Component-wise containment; exact inputs keep this exact.
+            if root == "/"
+                || canon == root
+                || (canon.len() > root.len()
+                    && canon.starts_with(root)
+                    && canon.as_bytes()[root.len()] == b'/')
+            {
+                return true;
+            }
         }
         match prefix.rsplit_once('/') {
             Some((parent, _)) => prefix = parent,
             None => return false,
         }
+    }
+}
+
+/// Data-relative path of child `name` given the parent's: Some("") marks the
+/// Data volume root itself, None means outside the Data volume (the common
+/// case — no allocation happens there either).
+fn child_data_rel(
+    name: &str,
+    ident: Option<(u64, u64)>,
+    parent_rel: Option<&str>,
+    ctx: &ScanCtx,
+) -> Option<String> {
+    match (ident, parent_rel) {
+        (Some(id), _) if ctx.data_root == Some(id) => Some(String::new()),
+        (_, Some(parent)) => Some(if parent.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent}/{name}")
+        }),
+        _ => None,
+    }
+}
+
+/// Data-relative path of the scan root itself: Some("") when the root IS the
+/// Data volume, else None (tracking starts if traversal later enters Data).
+fn root_data_rel(root_ident: Option<(u64, u64)>, data_root: Option<(u64, u64)>) -> Option<String> {
+    match root_ident {
+        Some(id) if Some(id) == data_root => Some(String::new()),
+        _ => None,
+    }
+}
+
+/// Build the dedup context for a scan rooted at `path`.
+fn make_scan_ctx(path: &Path) -> ScanCtx {
+    // Canonicalize once: resolves relative roots and symlinks (a symlinked
+    // root may really live inside the Data volume) for the containment check.
+    let scan_root = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_lowercase()
+        .into();
+    let firmlinks = load_firmlinks();
+    let data_root = if firmlinks.is_empty() {
+        None
+    } else {
+        let data_fd = getattrlistbulk::open_dir(Path::new("/System/Volumes/Data"));
+        let ident = dir_ident(data_fd);
+        getattrlistbulk::close_dir(data_fd);
+        ident
+    };
+    ScanCtx {
+        visited: VisitedDirs::default(),
+        firmlinks,
+        data_root,
+        scan_root,
     }
 }
 
@@ -556,34 +714,10 @@ fn build_root_node(path: &Path) -> FileNode {
             path
         );
     }
-    // Canonicalize once: resolves relative roots and symlinks (a symlinked
-    // root may really live inside the Data volume) for the containment check.
-    let scan_root = std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .to_lowercase();
-    let firmlinks = load_firmlinks();
-    let data_root = if firmlinks.is_empty() {
-        None
-    } else {
-        let data_fd = getattrlistbulk::open_dir(Path::new("/System/Volumes/Data"));
-        let ident = dir_ident(data_fd);
-        getattrlistbulk::close_dir(data_fd);
-        ident
-    };
-    let ctx = ScanCtx {
-        visited: VisitedDirs::default(),
-        firmlinks,
-        data_root,
-        scan_root,
-    };
+    let ctx = make_scan_ctx(path);
     let root_ident = dir_ident(fd);
     claim_ident(root_ident, &ctx.visited);
-    // Data-relative path of the root itself ("" when root IS the Data volume).
-    let root_rel = match root_ident {
-        Some(id) if ctx.data_root == Some(id) => Some(String::new()),
-        _ => None,
-    };
+    let root_rel = root_data_rel(root_ident, ctx.data_root);
     let name: Box<str> = path.display().to_string().into();
     let node = build_node_fd(fd, name, &ctx, root_rel.as_deref());
     getattrlistbulk::close_dir(fd);
@@ -647,19 +781,9 @@ fn build_node_fd(
     let build_child = |entry: &&DirEntry| -> Option<FileNode> {
         let child_fd = getattrlistbulk::openat_dir(parent_fd, &entry.name);
         let ident = dir_ident(child_fd);
-        // Track the Data-relative path once inside the Data volume. No
-        // allocation happens outside it (the common case).
-        let child_rel: Option<String> = match (ident, data_rel) {
-            (Some(id), _) if ctx.data_root == Some(id) => Some(String::new()),
-            (_, Some(parent)) if !ctx.firmlinks.is_empty() => Some(if parent.is_empty() {
-                entry.name.to_string()
-            } else {
-                format!("{parent}/{}", &entry.name)
-            }),
-            _ => None,
-        };
+        let child_rel = child_data_rel(&entry.name, ident, data_rel, ctx);
         if let Some(ref rel) = child_rel {
-            if !rel.is_empty() && mirror_in_scan(rel, ctx) {
+            if !rel.is_empty() && is_mirror_in_scan(rel, ctx) {
                 getattrlistbulk::close_dir(child_fd);
                 return None;
             }

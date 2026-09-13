@@ -41,6 +41,8 @@ pub(crate) struct DirEntry {
 }
 
 /// Open a directory and return its fd, or -1 on error.
+/// NOTE: follows symlinks — deliberate: an explicitly scanned root may be a
+/// link, while traversal (openat_dir) refuses them via O_NOFOLLOW.
 pub(crate) fn open_dir(dir_path: &Path) -> libc::c_int {
     let c_path = match CString::new(dir_path.as_os_str().as_bytes()) {
         Ok(p) => p,
