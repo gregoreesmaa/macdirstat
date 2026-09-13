@@ -201,6 +201,292 @@ fn collect_extensions(node: &FileNode, map: &mut HashMap<Box<str>, u64>) {
     }
 }
 
+/// Identity of a visited directory: (device, inode).
+/// Firmlinks expose the same directory at two paths (e.g. `/Users` and
+/// `/System/Volumes/Data/Users`) with identical dev+ino; without tracking,
+/// a scan covering both views counts everything twice.
+type VisitedDirs = Mutex<HashSet<(u64, u64)>>;
+
+/// Per-scan dedup state shared across traversal threads.
+struct ScanCtx {
+    visited: VisitedDirs,
+    /// Firmlink table: Data-relative target -> lowercased canonical absolute
+    /// path (e.g. `Users` -> `/users`). Empty when the table is unreadable,
+    /// in which case only `visited` applies.
+    firmlinks: HashMap<Box<str>, Box<str>>,
+    /// (dev, ino) of `/System/Volumes/Data`, or None when `firmlinks` is empty.
+    data_root: Option<(u64, u64)>,
+    /// Lowercased canonicalized scan root, for containment checks.
+    scan_root: Box<str>,
+}
+
+/// (dev, ino) identity of an open directory fd, or None if it can't be stated.
+fn dir_ident(fd: libc::c_int) -> Option<(u64, u64)> {
+    if fd < 0 {
+        return None;
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    Some((st.st_dev as u64, st.st_ino as u64))
+}
+
+/// Claim an identity for traversal. Returns false when already visited
+/// through another path. Fails open (returns true) when unstated.
+fn claim_ident(ident: Option<(u64, u64)>, visited: &VisitedDirs) -> bool {
+    match ident {
+        None => true,
+        Some(key) => visited
+            .lock()
+            .map(|mut guard| guard.insert(key))
+            .unwrap_or_else(|e| e.into_inner().insert(key)),
+    }
+}
+
+/// Parse firmlink pairs (Data-relative target -> lowercased canonical absolute
+/// path) from the text of the system table. Skips blanks, comments, and
+/// malformed lines.
+fn parse_firmlinks(text: &str) -> HashMap<Box<str>, Box<str>> {
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((canonical, target)) = line.split_once('\t') else {
+            continue;
+        };
+        let target = target.trim().trim_matches('/');
+        let canonical = canonical.trim().trim_matches('/');
+        if target.is_empty() || canonical.is_empty() {
+            continue;
+        }
+        map.insert(
+            target.into(),
+            format!("/{}", canonical.to_lowercase()).into(),
+        );
+    }
+    map
+}
+
+/// Load firmlink pairs from the system table. Empty map when unreadable.
+fn load_firmlinks() -> HashMap<Box<str>, Box<str>> {
+    match std::fs::read_to_string("/usr/share/firmlinks") {
+        Ok(text) => parse_firmlinks(&text),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Whether the Data-relative path `rel` (e.g. `Users/gregoreesmaa`) is a mirror
+/// whose canonical path is also being scanned (i.e. under the scan root).
+/// Then the canonical view covers it and it can be skipped — deterministically.
+/// When the canonical is outside the scan, the mirror is kept: it is the only
+/// view in this scan, so skipping it would lose content. Any matching target
+/// counts, from `rel` itself up through its parents.
+fn is_mirror_in_scan(rel: &str, ctx: &ScanCtx) -> bool {
+    if ctx.firmlinks.is_empty() {
+        return false;
+    }
+    let root: &str = &ctx.scan_root;
+    let mut prefix = rel;
+    loop {
+        if let Some(canon) = ctx.firmlinks.get(prefix) {
+            let canon: &str = canon;
+            // Byte comparison is exact because both sides arrive canonicalized
+            // and lowercased; the length check keeps "/users2" off "/users".
+            if root == "/"
+                || canon == root
+                || (canon.len() > root.len()
+                    && canon.starts_with(root)
+                    && canon.as_bytes()[root.len()] == b'/')
+            {
+                return true;
+            }
+        }
+        match prefix.rsplit_once('/') {
+            Some((parent, _)) => prefix = parent,
+            None => return false,
+        }
+    }
+}
+
+/// Data-relative path of child `name` given the parent's: Some("") marks the
+/// Data volume root itself, None means outside the Data volume (the common
+/// case — no allocation happens there either).
+fn child_data_rel(
+    name: &str,
+    ident: Option<(u64, u64)>,
+    parent_rel: Option<&str>,
+    ctx: &ScanCtx,
+) -> Option<String> {
+    match (ident, parent_rel) {
+        (Some(id), _) if ctx.data_root == Some(id) => Some(String::new()),
+        (_, Some(parent)) => Some(if parent.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent}/{name}")
+        }),
+        _ => None,
+    }
+}
+
+/// Data-relative path of the scan root itself: Some("") when the root IS the
+/// Data volume, else None (tracking starts if traversal later enters Data).
+fn root_data_rel(root_ident: Option<(u64, u64)>, data_root: Option<(u64, u64)>) -> Option<String> {
+    match root_ident {
+        Some(id) if Some(id) == data_root => Some(String::new()),
+        _ => None,
+    }
+}
+
+/// Build the dedup context for a scan rooted at `path`.
+fn make_scan_ctx(path: &Path) -> ScanCtx {
+    // Canonicalize once: resolves relative roots and symlinks (a symlinked
+    // root may really live inside the Data volume) for the containment check.
+    let scan_root = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_lowercase()
+        .into();
+    let firmlinks = load_firmlinks();
+    let data_root = if firmlinks.is_empty() {
+        None
+    } else {
+        let data_fd = getattrlistbulk::open_dir(Path::new("/System/Volumes/Data"));
+        let ident = dir_ident(data_fd);
+        getattrlistbulk::close_dir(data_fd);
+        ident
+    };
+    ScanCtx {
+        visited: VisitedDirs::default(),
+        firmlinks,
+        data_root,
+        scan_root,
+    }
+}
+
+fn build_root_node(path: &Path) -> FileNode {
+    let fd = getattrlistbulk::open_dir(path);
+    if fd < 0 {
+        eprintln!(
+            "Warning: could not open directory {:?} (permission denied or not found)",
+            path
+        );
+    }
+    let ctx = make_scan_ctx(path);
+    let root_ident = dir_ident(fd);
+    claim_ident(root_ident, &ctx.visited);
+    let root_rel = root_data_rel(root_ident, ctx.data_root);
+    let name: Box<str> = path.display().to_string().into();
+    let node = build_node_fd(fd, name, &ctx, root_rel.as_deref());
+    getattrlistbulk::close_dir(fd);
+    node
+}
+
+/// Build a FileNode from an already-opened directory fd.
+/// `node_name` is the display name for this node.
+/// `ctx` dedupes directories reachable via multiple paths (firmlinks);
+/// `data_rel` is this directory's path relative to `/System/Volumes/Data`
+/// (None when outside the Data volume — the common case, zero cost).
+fn build_node_fd(
+    parent_fd: libc::c_int,
+    node_name: Box<str>,
+    ctx: &ScanCtx,
+    data_rel: Option<&str>,
+) -> FileNode {
+    use rayon::prelude::*;
+
+    let entries = getattrlistbulk::scan_dir_entries_fd(parent_fd);
+
+    // Separate files and directories
+    let mut file_nodes: Vec<FileNode> = Vec::new();
+    let mut dir_names: Vec<&DirEntry> = Vec::new();
+    let mut total_size: u64 = 0;
+    let mut total_file_count: u64 = 0;
+
+    for entry in &entries {
+        if entry.is_dir {
+            dir_names.push(entry);
+        } else {
+            total_size += entry.file_size;
+            total_file_count += 1;
+            LOCAL_EXT_MAP.with(|m| {
+                let mut map = m.borrow_mut();
+                let ext = raw_extension(&entry.name);
+                let key: Box<str> = if ext.is_empty() {
+                    "(no ext)".into()
+                } else {
+                    ext.into()
+                };
+                *map.entry(key).or_default() += entry.file_size;
+            });
+            file_nodes.push(FileNode {
+                name: entry.name.clone(),
+                size: entry.file_size,
+                is_dir: false,
+                children: Box::new([]),
+                rect: treemap::Rect::new(),
+                file_count: 1,
+                dir_count: 0,
+            });
+        }
+    }
+
+    // Recurse into subdirectories — use openat() relative to parent fd.
+    // Two dedup layers: firmlink mirrors under /System/Volumes/Data whose
+    // canonical is also in this scan are skipped (deterministic), and
+    // anything already visited via another path is skipped as well
+    // (bind mounts and friends — first claim wins).
+    let build_child = |entry: &&DirEntry| -> Option<FileNode> {
+        let child_fd = getattrlistbulk::openat_dir(parent_fd, &entry.name);
+        let ident = dir_ident(child_fd);
+        let child_rel = child_data_rel(&entry.name, ident, data_rel, ctx);
+        if let Some(ref rel) = child_rel {
+            if !rel.is_empty() && is_mirror_in_scan(rel, ctx) {
+                getattrlistbulk::close_dir(child_fd);
+                return None;
+            }
+        }
+        if !claim_ident(ident, &ctx.visited) {
+            getattrlistbulk::close_dir(child_fd);
+            return None;
+        }
+        let node = build_node_fd(child_fd, entry.name.clone(), ctx, child_rel.as_deref());
+        getattrlistbulk::close_dir(child_fd);
+        Some(node)
+    };
+
+    let dir_nodes: Vec<FileNode> = if dir_names.len() >= 2 {
+        dir_names.par_iter().filter_map(build_child).collect()
+    } else {
+        dir_names.iter().filter_map(build_child).collect()
+    };
+
+    let mut total_dir_count: u64 = 0;
+    for child in &dir_nodes {
+        total_size += child.size;
+        total_file_count += child.file_count;
+        total_dir_count += child.dir_count;
+    }
+
+    let mut children: Vec<FileNode> = Vec::with_capacity(file_nodes.len() + dir_nodes.len());
+    children.extend(file_nodes);
+    children.extend(dir_nodes);
+
+    children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+
+    FileNode {
+        name: node_name,
+        size: total_size,
+        is_dir: true,
+        children: children.into(),
+        rect: treemap::Rect::new(),
+        file_count: total_file_count,
+        dir_count: total_dir_count + 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,291 +901,5 @@ mod tests {
         assert_eq!(tree.root.file_count, 1);
 
         let _ = std::fs::remove_dir_all(&base);
-    }
-}
-
-/// Identity of a visited directory: (device, inode).
-/// Firmlinks expose the same directory at two paths (e.g. `/Users` and
-/// `/System/Volumes/Data/Users`) with identical dev+ino; without tracking,
-/// a scan covering both views counts everything twice.
-type VisitedDirs = Mutex<HashSet<(u64, u64)>>;
-
-/// Per-scan dedup state shared across traversal threads.
-struct ScanCtx {
-    visited: VisitedDirs,
-    /// Firmlink table: Data-relative target -> lowercased canonical absolute
-    /// path (e.g. `Users` -> `/users`). Empty when the table is unreadable,
-    /// in which case only `visited` applies.
-    firmlinks: HashMap<Box<str>, Box<str>>,
-    /// (dev, ino) of `/System/Volumes/Data`, or None when `firmlinks` is empty.
-    data_root: Option<(u64, u64)>,
-    /// Lowercased canonicalized scan root, for containment checks.
-    scan_root: Box<str>,
-}
-
-/// (dev, ino) identity of an open directory fd, or None if it can't be stated.
-fn dir_ident(fd: libc::c_int) -> Option<(u64, u64)> {
-    if fd < 0 {
-        return None;
-    }
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return None;
-    }
-    Some((st.st_dev as u64, st.st_ino as u64))
-}
-
-/// Claim an identity for traversal. Returns false when already visited
-/// through another path. Fails open (returns true) when unstated.
-fn claim_ident(ident: Option<(u64, u64)>, visited: &VisitedDirs) -> bool {
-    match ident {
-        None => true,
-        Some(key) => visited
-            .lock()
-            .map(|mut guard| guard.insert(key))
-            .unwrap_or_else(|e| e.into_inner().insert(key)),
-    }
-}
-
-/// Parse firmlink pairs (Data-relative target -> lowercased canonical absolute
-/// path) from the text of the system table. Skips blanks, comments, and
-/// malformed lines.
-fn parse_firmlinks(text: &str) -> HashMap<Box<str>, Box<str>> {
-    let mut map = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((canonical, target)) = line.split_once('\t') else {
-            continue;
-        };
-        let target = target.trim().trim_matches('/');
-        let canonical = canonical.trim().trim_matches('/');
-        if target.is_empty() || canonical.is_empty() {
-            continue;
-        }
-        map.insert(
-            target.into(),
-            format!("/{}", canonical.to_lowercase()).into(),
-        );
-    }
-    map
-}
-
-/// Load firmlink pairs from the system table. Empty map when unreadable.
-fn load_firmlinks() -> HashMap<Box<str>, Box<str>> {
-    match std::fs::read_to_string("/usr/share/firmlinks") {
-        Ok(text) => parse_firmlinks(&text),
-        Err(_) => HashMap::new(),
-    }
-}
-
-/// Whether the Data-relative path `rel` (e.g. `Users/gregoreesmaa`) is a mirror
-/// whose canonical path is also being scanned (i.e. under the scan root).
-/// Then the canonical view covers it and it can be skipped — deterministically.
-/// When the canonical is outside the scan, the mirror is kept: it is the only
-/// view in this scan, so skipping it would lose content. Any matching target
-/// counts, from `rel` itself up through its parents.
-fn is_mirror_in_scan(rel: &str, ctx: &ScanCtx) -> bool {
-    if ctx.firmlinks.is_empty() {
-        return false;
-    }
-    let root: &str = &ctx.scan_root;
-    let mut prefix = rel;
-    loop {
-        if let Some(canon) = ctx.firmlinks.get(prefix) {
-            let canon: &str = canon;
-            // Byte comparison is exact because both sides arrive canonicalized
-            // and lowercased; the length check keeps "/users2" off "/users".
-            if root == "/"
-                || canon == root
-                || (canon.len() > root.len()
-                    && canon.starts_with(root)
-                    && canon.as_bytes()[root.len()] == b'/')
-            {
-                return true;
-            }
-        }
-        match prefix.rsplit_once('/') {
-            Some((parent, _)) => prefix = parent,
-            None => return false,
-        }
-    }
-}
-
-/// Data-relative path of child `name` given the parent's: Some("") marks the
-/// Data volume root itself, None means outside the Data volume (the common
-/// case — no allocation happens there either).
-fn child_data_rel(
-    name: &str,
-    ident: Option<(u64, u64)>,
-    parent_rel: Option<&str>,
-    ctx: &ScanCtx,
-) -> Option<String> {
-    match (ident, parent_rel) {
-        (Some(id), _) if ctx.data_root == Some(id) => Some(String::new()),
-        (_, Some(parent)) => Some(if parent.is_empty() {
-            name.to_string()
-        } else {
-            format!("{parent}/{name}")
-        }),
-        _ => None,
-    }
-}
-
-/// Data-relative path of the scan root itself: Some("") when the root IS the
-/// Data volume, else None (tracking starts if traversal later enters Data).
-fn root_data_rel(root_ident: Option<(u64, u64)>, data_root: Option<(u64, u64)>) -> Option<String> {
-    match root_ident {
-        Some(id) if Some(id) == data_root => Some(String::new()),
-        _ => None,
-    }
-}
-
-/// Build the dedup context for a scan rooted at `path`.
-fn make_scan_ctx(path: &Path) -> ScanCtx {
-    // Canonicalize once: resolves relative roots and symlinks (a symlinked
-    // root may really live inside the Data volume) for the containment check.
-    let scan_root = std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .to_lowercase()
-        .into();
-    let firmlinks = load_firmlinks();
-    let data_root = if firmlinks.is_empty() {
-        None
-    } else {
-        let data_fd = getattrlistbulk::open_dir(Path::new("/System/Volumes/Data"));
-        let ident = dir_ident(data_fd);
-        getattrlistbulk::close_dir(data_fd);
-        ident
-    };
-    ScanCtx {
-        visited: VisitedDirs::default(),
-        firmlinks,
-        data_root,
-        scan_root,
-    }
-}
-
-fn build_root_node(path: &Path) -> FileNode {
-    let fd = getattrlistbulk::open_dir(path);
-    if fd < 0 {
-        eprintln!(
-            "Warning: could not open directory {:?} (permission denied or not found)",
-            path
-        );
-    }
-    let ctx = make_scan_ctx(path);
-    let root_ident = dir_ident(fd);
-    claim_ident(root_ident, &ctx.visited);
-    let root_rel = root_data_rel(root_ident, ctx.data_root);
-    let name: Box<str> = path.display().to_string().into();
-    let node = build_node_fd(fd, name, &ctx, root_rel.as_deref());
-    getattrlistbulk::close_dir(fd);
-    node
-}
-
-/// Build a FileNode from an already-opened directory fd.
-/// `node_name` is the display name for this node.
-/// `ctx` dedupes directories reachable via multiple paths (firmlinks);
-/// `data_rel` is this directory's path relative to `/System/Volumes/Data`
-/// (None when outside the Data volume — the common case, zero cost).
-fn build_node_fd(
-    parent_fd: libc::c_int,
-    node_name: Box<str>,
-    ctx: &ScanCtx,
-    data_rel: Option<&str>,
-) -> FileNode {
-    use rayon::prelude::*;
-
-    let entries = getattrlistbulk::scan_dir_entries_fd(parent_fd);
-
-    // Separate files and directories
-    let mut file_nodes: Vec<FileNode> = Vec::new();
-    let mut dir_names: Vec<&DirEntry> = Vec::new();
-    let mut total_size: u64 = 0;
-    let mut total_file_count: u64 = 0;
-
-    for entry in &entries {
-        if entry.is_dir {
-            dir_names.push(entry);
-        } else {
-            total_size += entry.file_size;
-            total_file_count += 1;
-            LOCAL_EXT_MAP.with(|m| {
-                let mut map = m.borrow_mut();
-                let ext = raw_extension(&entry.name);
-                let key: Box<str> = if ext.is_empty() {
-                    "(no ext)".into()
-                } else {
-                    ext.into()
-                };
-                *map.entry(key).or_default() += entry.file_size;
-            });
-            file_nodes.push(FileNode {
-                name: entry.name.clone(),
-                size: entry.file_size,
-                is_dir: false,
-                children: Box::new([]),
-                rect: treemap::Rect::new(),
-                file_count: 1,
-                dir_count: 0,
-            });
-        }
-    }
-
-    // Recurse into subdirectories — use openat() relative to parent fd.
-    // Two dedup layers: firmlink mirrors under /System/Volumes/Data whose
-    // canonical is also in this scan are skipped (deterministic), and
-    // anything already visited via another path is skipped as well
-    // (bind mounts and friends — first claim wins).
-    let build_child = |entry: &&DirEntry| -> Option<FileNode> {
-        let child_fd = getattrlistbulk::openat_dir(parent_fd, &entry.name);
-        let ident = dir_ident(child_fd);
-        let child_rel = child_data_rel(&entry.name, ident, data_rel, ctx);
-        if let Some(ref rel) = child_rel {
-            if !rel.is_empty() && is_mirror_in_scan(rel, ctx) {
-                getattrlistbulk::close_dir(child_fd);
-                return None;
-            }
-        }
-        if !claim_ident(ident, &ctx.visited) {
-            getattrlistbulk::close_dir(child_fd);
-            return None;
-        }
-        let node = build_node_fd(child_fd, entry.name.clone(), ctx, child_rel.as_deref());
-        getattrlistbulk::close_dir(child_fd);
-        Some(node)
-    };
-
-    let dir_nodes: Vec<FileNode> = if dir_names.len() >= 2 {
-        dir_names.par_iter().filter_map(build_child).collect()
-    } else {
-        dir_names.iter().filter_map(build_child).collect()
-    };
-
-    let mut total_dir_count: u64 = 0;
-    for child in &dir_nodes {
-        total_size += child.size;
-        total_file_count += child.file_count;
-        total_dir_count += child.dir_count;
-    }
-
-    let mut children: Vec<FileNode> = Vec::with_capacity(file_nodes.len() + dir_nodes.len());
-    children.extend(file_nodes);
-    children.extend(dir_nodes);
-
-    children.sort_unstable_by(|a, b| b.size.cmp(&a.size));
-
-    FileNode {
-        name: node_name,
-        size: total_size,
-        is_dir: true,
-        children: children.into(),
-        rect: treemap::Rect::new(),
-        file_count: total_file_count,
-        dir_count: total_dir_count + 1,
     }
 }
