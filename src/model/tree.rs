@@ -302,32 +302,61 @@ mod tests {
         assert_eq!(a.children.len(), 1);
         assert_eq!(b.children.len(), 1);
         assert_eq!(tree.root.dir_count, 3, "root + a + b");
+        assert_eq!(tree.root.file_count, 2, "one file per dir");
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Firmlink mirror matching: exact targets and anything beneath them
-    /// match; siblings and lookalike prefixes must not.
+    /// Mirror pruning: exact targets and anything beneath them are skipped
+    /// when the canonical is in the scan; siblings, lookalike prefixes, and
+    /// mirrors whose canonical is outside the scan are kept.
     #[test]
     fn firmlink_mirror_matching() {
-        let targets: HashSet<Box<str>> =
-            ["Users".into(), "System/Library/Caches".into(), "usr/local".into()]
-                .into_iter()
-                .collect();
-        assert!(is_firmlink_mirror("Users", &targets));
-        assert!(is_firmlink_mirror("Users/gregoreesmaa", &targets));
-        assert!(is_firmlink_mirror("System/Library/Caches", &targets));
-        assert!(!is_firmlink_mirror("System/Library", &targets));
-        assert!(!is_firmlink_mirror("System", &targets));
-        assert!(!is_firmlink_mirror("Users2", &targets));
-        assert!(!is_firmlink_mirror("Applications", &targets));
-        assert!(!is_firmlink_mirror("usr/libexec", &targets));
-        assert!(is_firmlink_mirror("usr/local/bin", &targets));
+        let ctx_for = |root: &str| ScanCtx {
+            visited: VisitedDirs::default(),
+            firmlinks: [
+                ("Users".into(), "/users".into()),
+                ("System/Library/Caches".into(), "/system/library/caches".into()),
+                ("usr/local".into(), "/usr/local".into()),
+            ]
+            .into_iter()
+            .collect(),
+            data_root: None,
+            scan_root: root.into(),
+        };
+        let root = ctx_for("/");
+        assert!(mirror_in_scan("Users", &root));
+        assert!(mirror_in_scan("Users/gregoreesmaa", &root));
+        assert!(mirror_in_scan("System/Library/Caches", &root));
+        assert!(!mirror_in_scan("System/Library", &root));
+        assert!(!mirror_in_scan("System", &root));
+        assert!(!mirror_in_scan("Users2", &root));
+        assert!(!mirror_in_scan("Applications", &root));
+        assert!(!mirror_in_scan("usr/libexec", &root));
+        assert!(mirror_in_scan("usr/local/bin", &root));
+
+        // Same mirrors, narrower scan: canonicals outside are kept.
+        let sys = ctx_for("/system");
+        assert!(!mirror_in_scan("Users", &sys));
+        assert!(mirror_in_scan("System/Library/Caches", &sys));
+        assert!(!mirror_in_scan("usr/local", &sys));
+    }
+
+    /// Containment is component-wise: `/xy` is not under `/x`.
+    #[test]
+    fn under_root_matching() {
+        assert!(under_root("/users", "/"));
+        assert!(under_root("/users", "/users"));
+        assert!(under_root("/users/gregoreesmaa", "/users"));
+        assert!(under_root("/system/library/caches", "/system"));
+        assert!(!under_root("/users2", "/users"));
+        assert!(!under_root("/users", "/system"));
+        assert!(!under_root("/system", "/system/library"));
     }
 
     /// End-to-end prune through real traversal: with a synthetic ctx treating
-    /// the fixture root as the Data volume and `a` as a mirror target, `a`
-    /// disappears while its sibling `b` scans normally.
+    /// the fixture root as the Data volume and `a` as a mirror target whose
+    /// canonical is in the scan, `a` disappears while sibling `b` scans normally.
     #[test]
     fn firmlink_mirror_subtree_is_skipped() {
         let base = std::env::temp_dir().join(format!(
@@ -346,8 +375,9 @@ mod tests {
         getattrlistbulk::close_dir(base_fd);
         let ctx = ScanCtx {
             visited: VisitedDirs::default(),
-            firmlinks: ["a".into()].into_iter().collect(),
+            firmlinks: [("a".into(), "/base/a".into())].into_iter().collect(),
             data_root: base_id,
+            scan_root: "/base".into(),
         };
         let root_fd = getattrlistbulk::open_dir(&base);
         // The fixture root plays the Data volume: its Data-relative path is "".
@@ -361,19 +391,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The real firmlink table parses to the expected targets (macOS only).
+    /// Same fixture, but the mirror's canonical is outside the scan:
+    /// the mirror is the only view, so it must be kept (no undercount).
+    #[test]
+    fn firmlink_mirror_kept_when_canonical_outside_scan() {
+        let base = std::env::temp_dir().join(format!(
+            "macdirstat-mirror-kept-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        std::fs::create_dir_all(base.join("b")).unwrap();
+        std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
+        std::fs::write(base.join("b/file.txt"), vec![b'y'; 512]).unwrap();
+
+        let base_fd = getattrlistbulk::open_dir(&base);
+        let base_id = dir_ident(base_fd);
+        assert!(base_id.is_some());
+        getattrlistbulk::close_dir(base_fd);
+        let ctx = ScanCtx {
+            visited: VisitedDirs::default(),
+            firmlinks: [("a".into(), "/elsewhere/a".into())]
+                .into_iter()
+                .collect(),
+            data_root: base_id,
+            scan_root: "/base".into(),
+        };
+        let root_fd = getattrlistbulk::open_dir(&base);
+        let node = build_node_fd(root_fd, "base".into(), &ctx, Some(""));
+        getattrlistbulk::close_dir(root_fd);
+
+        assert_eq!(node.children.len(), 2);
+        assert_eq!(node.dir_count, 3, "root + a + b");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The real firmlink table parses to the expected pairs (macOS only).
     #[test]
     fn firmlink_table_loads() {
         if !std::path::Path::new("/usr/share/firmlinks").exists() {
             return; // not macOS — nothing to parse
         }
-        let targets = load_firmlink_targets();
-        assert!(targets.contains("Users"));
-        assert!(targets.contains("System/Library/Caches"));
-        for t in targets.iter() {
-            assert!(!t.is_empty());
-            assert!(!t.starts_with('/'));
-            assert!(!t.ends_with('/'));
+        let pairs = load_firmlinks();
+        assert_eq!(pairs.get("Users").map(String::as_str), Some("/users"));
+        assert_eq!(
+            pairs.get("System/Library/Caches").map(String::as_str),
+            Some("/system/library/caches")
+        );
+        for (target, canon) in pairs.iter() {
+            assert!(!target.is_empty());
+            assert!(!target.starts_with('/'));
+            assert!(canon.starts_with('/'), "canonical must be absolute");
         }
     }
 }
@@ -387,13 +456,14 @@ type VisitedDirs = Mutex<HashSet<(u64, u64)>>;
 /// Per-scan dedup state shared across traversal threads.
 struct ScanCtx {
     visited: VisitedDirs,
-    /// Data-relative firmlink targets from `/usr/share/firmlinks`
-    /// (e.g. `Users`, `System/Library/Caches`). Empty when the table is
-    /// unreadable or the scan root lives inside the Data volume (single
-    /// view — nothing to disambiguate), in which case only `visited` applies.
-    firmlinks: HashSet<Box<str>>,
-    /// (dev, ino) of `/System/Volumes/Data`, or None when disabled as above.
+    /// Firmlink table: Data-relative target -> lowercased canonical absolute
+    /// path (e.g. `Users` -> `/users`). Empty when the table is unreadable,
+    /// in which case only `visited` applies.
+    firmlinks: HashMap<Box<str>, String>,
+    /// (dev, ino) of `/System/Volumes/Data`, or None when `firmlinks` is empty.
     data_root: Option<(u64, u64)>,
+    /// Lowercased canonicalized scan root, for containment checks.
+    scan_root: String,
 }
 
 /// (dev, ino) identity of an open directory fd, or None if it can't be stated.
@@ -420,43 +490,56 @@ fn claim_ident(ident: Option<(u64, u64)>, visited: &VisitedDirs) -> bool {
     }
 }
 
-/// Whether `path` lives inside the Data volume (single firmlink view —
-/// the mirror table must not prune anything). String-prefix is enough:
-/// a wrong answer only falls back to visited-set dedup, never to a wrong total.
-fn path_inside_data(path: &Path) -> bool {
-    path.starts_with("/System/Volumes/Data")
-}
-
-/// Load Data-relative firmlink targets (`Users`, `usr/local`, ...) from the
-/// system firmlink table. Returns an empty set when unreadable.
-fn load_firmlink_targets() -> HashSet<Box<str>> {
-    let mut set = HashSet::new();
+/// Load firmlink pairs (Data-relative target -> lowercased canonical absolute
+/// path) from the system table. Returns an empty map when unreadable.
+fn load_firmlinks() -> HashMap<Box<str>, String> {
+    let mut map = HashMap::new();
     let Ok(text) = std::fs::read_to_string("/usr/share/firmlinks") else {
-        return set;
+        return map;
     };
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((_, target)) = line.split_once('\t') {
+        if let Some((canonical, target)) = line.split_once('\t') {
             let target = target.trim().trim_matches('/');
-            if !target.is_empty() {
-                set.insert(target.into());
+            let canonical = canonical.trim().trim_matches('/');
+            if target.is_empty() || canonical.is_empty() {
+                continue;
             }
+            map.insert(target.into(), format!("/{}", canonical.to_lowercase()));
         }
     }
-    set
+    map
 }
 
-/// Whether the Data-relative path `rel` (e.g. `Users/gregoreesmaa`) is a
-/// firmlink mirror: it equals a target or sits beneath one, so the same
-/// directory is also reachable via its canonical path.
-fn is_firmlink_mirror(rel: &str, targets: &HashSet<Box<str>>) -> bool {
+/// Component-wise `canon.starts_with(root)` on lowercased absolute paths.
+/// A wrong answer only falls back to visited-set dedup, never to a wrong total.
+fn under_root(canon: &str, root: &str) -> bool {
+    if root == "/" {
+        return true; // canonicals are absolute
+    }
+    canon == root
+        || (canon.len() > root.len()
+            && canon.starts_with(root)
+            && canon.as_bytes()[root.len()] == b'/')
+}
+
+/// Whether the Data-relative path `rel` (e.g. `Users/gregoreesmaa`) is a mirror
+/// whose canonical path is also being scanned (i.e. under the scan root).
+/// Then the canonical view covers it and it can be skipped — deterministically.
+/// When the canonical is outside the scan, the mirror is kept: it is the only
+/// view in this scan, so skipping it would lose content.
+fn mirror_in_scan(rel: &str, ctx: &ScanCtx) -> bool {
+    if ctx.firmlinks.is_empty() {
+        return false;
+    }
+    // Longest match first: walk rel, then its parents.
     let mut prefix = rel;
     loop {
-        if targets.contains(prefix) {
-            return true;
+        if let Some(canon) = ctx.firmlinks.get(prefix) {
+            return under_root(canon, &ctx.scan_root);
         }
         match prefix.rsplit_once('/') {
             Some((parent, _)) => prefix = parent,
@@ -473,11 +556,13 @@ fn build_root_node(path: &Path) -> FileNode {
             path
         );
     }
-    let firmlinks = if path_inside_data(path) {
-        HashSet::new()
-    } else {
-        load_firmlink_targets()
-    };
+    // Canonicalize once: resolves relative roots and symlinks (a symlinked
+    // root may really live inside the Data volume) for the containment check.
+    let scan_root = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_lowercase();
+    let firmlinks = load_firmlinks();
     let data_root = if firmlinks.is_empty() {
         None
     } else {
@@ -490,6 +575,7 @@ fn build_root_node(path: &Path) -> FileNode {
         visited: VisitedDirs::default(),
         firmlinks,
         data_root,
+        scan_root,
     };
     let root_ident = dir_ident(fd);
     claim_ident(root_ident, &ctx.visited);
@@ -554,9 +640,9 @@ fn build_node_fd(
     }
 
     // Recurse into subdirectories — use openat() relative to parent fd.
-    // Two dedup layers: firmlink mirrors under /System/Volumes/Data are
-    // always skipped (their canonical path covers them — deterministic),
-    // and anything already visited via another path is skipped as well
+    // Two dedup layers: firmlink mirrors under /System/Volumes/Data whose
+    // canonical is also in this scan are skipped (deterministic), and
+    // anything already visited via another path is skipped as well
     // (bind mounts and friends — first claim wins).
     let build_child = |entry: &&DirEntry| -> Option<FileNode> {
         let child_fd = getattrlistbulk::openat_dir(parent_fd, &entry.name);
@@ -573,7 +659,7 @@ fn build_node_fd(
             _ => None,
         };
         if let Some(ref rel) = child_rel {
-            if !rel.is_empty() && is_firmlink_mirror(rel, &ctx.firmlinks) {
+            if !rel.is_empty() && mirror_in_scan(rel, ctx) {
                 getattrlistbulk::close_dir(child_fd);
                 return None;
             }
