@@ -612,9 +612,10 @@ mod tests {
         std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
         std::fs::write(base.join("b/file.txt"), vec![b'y'; 512]).unwrap();
         std::fs::write(base.join("top.md"), vec![b'z'; 256]).unwrap();
+        std::fs::write(base.join("README"), vec![b'r'; 128]).unwrap();
 
         let _guard = lock_scans();
-        let tree = FileTree::scan(&base);
+        let mut tree = FileTree::scan(&base);
 
         let a = find_child(&tree.root, "a");
         let b = find_child(&tree.root, "b");
@@ -622,7 +623,7 @@ mod tests {
         assert_eq!(a.children.len(), 1);
         assert_eq!(b.children.len(), 1);
         assert_eq!(tree.root.dir_count, 3, "root + a + b");
-        assert_eq!(tree.root.file_count, 3, "one file per dir + top-level");
+        assert_eq!(tree.root.file_count, 4, "one file per dir + top-level");
         // Extension stats drain into the tree: both txt files, summed.
         let txt = tree
             .extensions
@@ -638,6 +639,15 @@ mod tests {
             .find(|(ext, _)| &**ext == "md")
             .map(|(_, n)| *n);
         assert_eq!(md, Some(256));
+        // The extensionless file must land in the "(no ext)" bucket on both
+        // the scan path and the rebuild path (pins ext_bucket's sentinel
+        // mapping at both call sites).
+        fn bucket(exts: &[(Box<str>, u64)], name: &str) -> Option<u64> {
+            exts.iter().find(|(ext, _)| &**ext == name).map(|(_, n)| *n)
+        }
+        assert_eq!(bucket(&tree.extensions, "(no ext)"), Some(128));
+        tree.rebuild_extensions();
+        assert_eq!(bucket(&tree.extensions, "(no ext)"), Some(128));
 
         let _ = std::fs::remove_dir_all(&base);
     }
