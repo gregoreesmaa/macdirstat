@@ -19,6 +19,17 @@ fn raw_extension(name: &str) -> &str {
     }
 }
 
+/// Bucket key for extension stats: the raw extension, or the sentinel for
+/// extensionless files. Single owner of the `"(no ext)"` sentinel.
+fn ext_bucket(name: &str) -> Box<str> {
+    let ext = raw_extension(name);
+    if ext.is_empty() {
+        "(no ext)".into()
+    } else {
+        ext.into()
+    }
+}
+
 /// A node in the file tree. Uses compact representation (Box<str> + Box<[T]>)
 /// as validated by memory benchmarks: 40 bytes/struct, ~78 bytes RSS/node.
 pub struct FileNode {
@@ -179,12 +190,9 @@ impl FileTree {
 
 fn collect_extensions(node: &FileNode, map: &mut HashMap<Box<str>, u64>) {
     if !node.is_dir {
-        let ext = node.extension();
-        if !ext.is_empty() {
-            *map.entry(ext.into()).or_default() += node.size;
-        } else {
-            *map.entry("(no ext)".into()).or_default() += node.size;
-        }
+        // (extension() returns "" for dirs, but this branch only runs for files,
+        // so it agrees with raw_extension here.)
+        *map.entry(ext_bucket(&node.name)).or_default() += node.size;
     }
     for child in node.children.iter() {
         collect_extensions(child, map);
@@ -396,13 +404,7 @@ fn build_node_fd(
             total_file_count += 1;
             LOCAL_EXT_MAP.with(|m| {
                 let mut map = m.borrow_mut();
-                let ext = raw_extension(&entry.name);
-                let key: Box<str> = if ext.is_empty() {
-                    "(no ext)".into()
-                } else {
-                    ext.into()
-                };
-                *map.entry(key).or_default() += entry.file_size;
+                *map.entry(ext_bucket(&entry.name)).or_default() += entry.file_size;
             });
             file_nodes.push(FileNode {
                 name: entry.name.clone(),
@@ -609,6 +611,7 @@ mod tests {
         std::fs::create_dir_all(base.join("b")).unwrap();
         std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
         std::fs::write(base.join("b/file.txt"), vec![b'y'; 512]).unwrap();
+        std::fs::write(base.join("top.md"), vec![b'z'; 256]).unwrap();
 
         let _guard = lock_scans();
         let tree = FileTree::scan(&base);
@@ -619,7 +622,7 @@ mod tests {
         assert_eq!(a.children.len(), 1);
         assert_eq!(b.children.len(), 1);
         assert_eq!(tree.root.dir_count, 3, "root + a + b");
-        assert_eq!(tree.root.file_count, 2, "one file per dir");
+        assert_eq!(tree.root.file_count, 3, "one file per dir + top-level");
         // Extension stats drain into the tree: both txt files, summed.
         let txt = tree
             .extensions
@@ -627,6 +630,14 @@ mod tests {
             .find(|(ext, _)| &**ext == "txt")
             .map(|(_, n)| *n);
         assert_eq!(txt, Some(a.size + b.size));
+        // Root-level files are recorded on the scan thread, so this pins the
+        // main-thread drain arm (deleting it drops the md entry silently).
+        let md = tree
+            .extensions
+            .iter()
+            .find(|(ext, _)| &**ext == "md")
+            .map(|(_, n)| *n);
+        assert_eq!(md, Some(256));
 
         let _ = std::fs::remove_dir_all(&base);
     }
