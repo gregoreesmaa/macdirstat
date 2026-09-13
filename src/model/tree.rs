@@ -80,29 +80,19 @@ impl FileTree {
         let ext_map = Mutex::new(HashMap::<Box<str>, u64>::new());
         let root_node = build_root_node(root);
 
-        // Drain the main thread's local ext map
-        LOCAL_EXT_MAP.with(|m| {
-            let local = m.replace(HashMap::new());
+        // Merge one thread's local ext map into the global one.
+        let merge = |local: HashMap<Box<str>, u64>| {
             if !local.is_empty() {
                 let mut global = ext_map.lock().unwrap_or_else(|e| e.into_inner());
                 for (k, v) in local {
                     *global.entry(k).or_default() += v;
                 }
             }
-        });
+        };
 
-        // Drain all rayon worker thread local ext maps
-        rayon::broadcast(|_| {
-            LOCAL_EXT_MAP.with(|m| {
-                let local = m.replace(HashMap::new());
-                if !local.is_empty() {
-                    let mut global = ext_map.lock().unwrap_or_else(|e| e.into_inner());
-                    for (k, v) in local {
-                        *global.entry(k).or_default() += v;
-                    }
-                }
-            });
-        });
+        // Drain the main thread's local ext map, then all rayon workers'.
+        LOCAL_EXT_MAP.with(|m| merge(m.replace(HashMap::new())));
+        rayon::broadcast(|_| LOCAL_EXT_MAP.with(|m| merge(m.replace(HashMap::new()))));
 
         let mut extensions: Vec<(Box<str>, u64)> = ext_map
             .into_inner()
@@ -331,15 +321,6 @@ fn child_data_rel(
     }
 }
 
-/// Data-relative path of the scan root itself: Some("") when the root IS the
-/// Data volume, else None (tracking starts if traversal later enters Data).
-fn root_data_rel(root_ident: Option<(u64, u64)>, data_root: Option<(u64, u64)>) -> Option<String> {
-    match root_ident {
-        Some(id) if Some(id) == data_root => Some(String::new()),
-        _ => None,
-    }
-}
-
 /// Build the dedup context for a scan rooted at `path`.
 fn make_scan_ctx(path: &Path) -> ScanCtx {
     // Canonicalize once: resolves relative roots and symlinks (a symlinked
@@ -377,7 +358,9 @@ fn build_root_node(path: &Path) -> FileNode {
     let ctx = make_scan_ctx(path);
     let root_ident = dir_ident(fd);
     claim_ident(root_ident, &ctx.visited);
-    let root_rel = root_data_rel(root_ident, ctx.data_root);
+    // The root behaves like a child of nowhere: its rel is set only when
+    // the root IS the Data volume.
+    let root_rel = child_data_rel("", root_ident, None, &ctx);
     let name: Box<str> = path.display().to_string().into();
     let node = build_node_fd(fd, name, &ctx, root_rel.as_deref());
     getattrlistbulk::close_dir(fd);
@@ -504,6 +487,25 @@ mod tests {
     // Poison-tolerant like production locks: one failing test must not cascade.
     static SCAN_LOCK: Mutex<()> = Mutex::new(());
 
+    fn lock_scans() -> std::sync::MutexGuard<'static, ()> {
+        SCAN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // Discard thread-local extension entries on this thread and all rayon
+    // workers. Direct build_node_fd calls accumulate entries with no drain;
+    // without this, the next FileTree::scan sweeps them into its own stats.
+    // Takes the scan guard: draining is only meaningful under the lock.
+    fn drain_local_ext_maps(_guard: &std::sync::MutexGuard<'static, ()>) {
+        LOCAL_EXT_MAP.with(|m| {
+            m.borrow_mut().clear();
+        });
+        rayon::broadcast(|_| {
+            LOCAL_EXT_MAP.with(|m| {
+                m.borrow_mut().clear();
+            });
+        });
+    }
+
     // Find a direct child by name, panicking with its name when absent.
     fn find_child<'a>(root: &'a FileNode, name: &str) -> &'a FileNode {
         root.children
@@ -514,7 +516,9 @@ mod tests {
 
     // Fixture with subdirs a/ and b/ (512B file each). The caller plays the
     // Data volume root; `a` is the mirror target with the given canonical.
-    // Tags must stay distinct: temp dirs are shared per process.
+    // Tags must stay distinct: temp dirs are shared per process. The scan
+    // root is synthetic (lowercase by construction); only its prefix
+    // relation to the canonical matters.
     fn mirror_fixture(tag: &str, canon: &str) -> (std::path::PathBuf, ScanCtx) {
         let base = temp_base(tag);
         std::fs::create_dir_all(base.join("a")).unwrap();
@@ -532,25 +536,6 @@ mod tests {
             scan_root: "/base".into(),
         };
         (base, ctx)
-    }
-
-    fn lock_scans() -> std::sync::MutexGuard<'static, ()> {
-        SCAN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    // Discard thread-local extension entries on this thread and all rayon
-    // workers. Direct build_node_fd calls accumulate entries with no drain;
-    // without this, the next FileTree::scan sweeps them into its own stats.
-    // Call while holding the scan lock.
-    fn drain_local_ext_maps() {
-        LOCAL_EXT_MAP.with(|m| {
-            m.borrow_mut().clear();
-        });
-        rayon::broadcast(|_| {
-            LOCAL_EXT_MAP.with(|m| {
-                m.borrow_mut().clear();
-            });
-        });
     }
 
     /// Scanning must not follow symlinks: a symlink to a dir stays a childless
@@ -718,7 +703,7 @@ mod tests {
         // The fixture root plays the Data volume: its Data-relative path is "".
         let node = build_node_fd(root_fd, "base".into(), &ctx, Some(""));
         getattrlistbulk::close_dir(root_fd);
-        drain_local_ext_maps();
+        drain_local_ext_maps(&_guard);
 
         assert_eq!(node.children.len(), 1);
         assert_eq!(&*node.children[0].name, "b");
@@ -743,7 +728,7 @@ mod tests {
         let root_fd = getattrlistbulk::open_dir(&base);
         let node = build_node_fd(root_fd, "base".into(), &ctx, Some(""));
         getattrlistbulk::close_dir(root_fd);
-        drain_local_ext_maps();
+        drain_local_ext_maps(&_guard);
 
         assert_eq!(node.children.len(), 2);
         assert_eq!(node.dir_count, 3, "root + a + b");
@@ -810,15 +795,6 @@ mod tests {
             .to_lowercase();
         assert_eq!(&*ctx.scan_root, expect.as_str());
         assert_eq!(ctx.data_root.is_some(), !ctx.firmlinks.is_empty());
-
-        // Root==Data marks the root rel; anything else leaves it unset.
-        assert_eq!(
-            root_data_rel(Some((7, 7)), Some((7, 7))),
-            Some(String::new())
-        );
-        assert_eq!(root_data_rel(Some((7, 7)), Some((8, 8))), None);
-        assert_eq!(root_data_rel(None, Some((7, 7))), None);
-        assert_eq!(root_data_rel(Some((7, 7)), None), None);
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -899,6 +875,13 @@ mod tests {
             child_data_rel("c", Some((1, 2)), Some(""), &ctx),
             Some("c".into())
         );
+        // The scan root itself: set only when the root IS the Data volume.
+        assert_eq!(
+            child_data_rel("", Some((9, 9)), None, &ctx),
+            Some(String::new())
+        );
+        assert_eq!(child_data_rel("", Some((1, 2)), None, &ctx), None);
+        assert_eq!(child_data_rel("", None, None, &ctx), None);
     }
 
     /// An explicitly scanned root may be a symlink: open_dir follows it
