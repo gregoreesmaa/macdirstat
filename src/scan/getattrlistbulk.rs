@@ -30,6 +30,9 @@ const ATTR_FILE_TOTALSIZE: libc::attrgroup_t = 0x0000_0002;
 // Object types
 const VDIR: u32 = 2; // directory
 
+// getattrlistbulk option: report the link itself, never its target (sys/attr.h).
+const FSOPT_NOFOLLOW: u64 = 0x00000001;
+
 /// A directory entry with name, type, and size.
 pub(crate) struct DirEntry {
     pub name: Box<str>,
@@ -62,7 +65,7 @@ pub(crate) fn openat_dir(parent_fd: libc::c_int, name: &str) -> libc::c_int {
             libc::openat(
                 parent_fd,
                 buf.as_ptr() as *const libc::c_char,
-                libc::O_RDONLY | libc::O_DIRECTORY,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
             )
         }
     } else {
@@ -74,7 +77,7 @@ pub(crate) fn openat_dir(parent_fd: libc::c_int, name: &str) -> libc::c_int {
             libc::openat(
                 parent_fd,
                 c_name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
             )
         }
     }
@@ -110,7 +113,7 @@ pub(crate) fn scan_dir_entries_fd(fd: libc::c_int) -> Vec<DirEntry> {
                     &attrlist as *const libc::attrlist as *mut libc::c_void,
                     buffer.as_mut_ptr() as *mut libc::c_void,
                     buffer.len(),
-                    0,
+                    FSOPT_NOFOLLOW,
                 )
             };
 
