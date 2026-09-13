@@ -501,7 +501,57 @@ mod tests {
 
     // FileTree::scan drains thread-local extension maps via a rayon broadcast,
     // so concurrent scans in one process can swap entries: serialize scans.
+    // Poison-tolerant like production locks: one failing test must not cascade.
     static SCAN_LOCK: Mutex<()> = Mutex::new(());
+
+    // Find a direct child by name, panicking with its name when absent.
+    fn find_child<'a>(root: &'a FileNode, name: &str) -> &'a FileNode {
+        root.children
+            .iter()
+            .find(|c| &*c.name == name)
+            .unwrap_or_else(|| panic!("missing child {name}"))
+    }
+
+    // Fixture with subdirs a/ and b/ (512B file each). The caller plays the
+    // Data volume root; `a` is the mirror target with the given canonical.
+    // Tags must stay distinct: temp dirs are shared per process.
+    fn mirror_fixture(tag: &str, canon: &str) -> (std::path::PathBuf, ScanCtx) {
+        let base = temp_base(tag);
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        std::fs::create_dir_all(base.join("b")).unwrap();
+        std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
+        std::fs::write(base.join("b/file.txt"), vec![b'y'; 512]).unwrap();
+        let base_fd = getattrlistbulk::open_dir(&base);
+        let base_id = dir_ident(base_fd);
+        assert!(base_id.is_some());
+        getattrlistbulk::close_dir(base_fd);
+        let ctx = ScanCtx {
+            visited: VisitedDirs::default(),
+            firmlinks: [("a".into(), canon.into())].into_iter().collect(),
+            data_root: base_id,
+            scan_root: "/base".into(),
+        };
+        (base, ctx)
+    }
+
+    fn lock_scans() -> std::sync::MutexGuard<'static, ()> {
+        SCAN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // Discard thread-local extension entries on this thread and all rayon
+    // workers. Direct build_node_fd calls accumulate entries with no drain;
+    // without this, the next FileTree::scan sweeps them into its own stats.
+    // Call while holding the scan lock.
+    fn drain_local_ext_maps() {
+        LOCAL_EXT_MAP.with(|m| {
+            m.borrow_mut().clear();
+        });
+        rayon::broadcast(|_| {
+            LOCAL_EXT_MAP.with(|m| {
+                m.borrow_mut().clear();
+            });
+        });
+    }
 
     /// Scanning must not follow symlinks: a symlink to a dir stays a childless
     /// file node, its target is counted once, and a self-loop terminates.
@@ -514,26 +564,22 @@ mod tests {
         symlink("real/file.txt", base.join("link_to_file")).unwrap();
         symlink("loop", base.join("loop")).unwrap();
 
-        let _guard = SCAN_LOCK.lock().expect("scan lock");
+        let _guard = lock_scans();
         let tree = FileTree::scan(&base);
 
-        let find = |name: &str| {
-            tree.root
-                .children
-                .iter()
-                .find(|c| &*c.name == name)
-                .unwrap_or_else(|| panic!("missing child {name}"))
-        };
-        let link = find("link_to_real");
+        let link = find_child(&tree.root, "link_to_real");
         assert!(!link.is_dir, "symlink to a dir must not be a dir node");
         assert!(link.children.is_empty());
-        let lf = find("link_to_file");
+        let lf = find_child(&tree.root, "link_to_file");
         assert!(!lf.is_dir, "symlink to a file must not be a dir node");
         assert!(lf.children.is_empty());
-        assert!(lf.size < find("real").size, "file link reports link size");
-        let lp = find("loop");
+        assert!(
+            lf.size < find_child(&tree.root, "real").size,
+            "file link reports link size"
+        );
+        let lp = find_child(&tree.root, "loop");
         assert!(!lp.is_dir, "symlink loop must not be a dir node");
-        let real = find("real");
+        let real = find_child(&tree.root, "real");
         assert!(real.is_dir);
         assert_eq!(real.children.len(), 1);
         assert!(
@@ -579,18 +625,11 @@ mod tests {
         std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
         std::fs::write(base.join("b/file.txt"), vec![b'y'; 512]).unwrap();
 
-        let _guard = SCAN_LOCK.lock().expect("scan lock");
+        let _guard = lock_scans();
         let tree = FileTree::scan(&base);
 
-        let find = |name: &str| {
-            tree.root
-                .children
-                .iter()
-                .find(|c| &*c.name == name)
-                .unwrap_or_else(|| panic!("missing child {name}"))
-        };
-        let a = find("a");
-        let b = find("b");
+        let a = find_child(&tree.root, "a");
+        let b = find_child(&tree.root, "b");
         assert!(a.is_dir && b.is_dir);
         assert_eq!(a.children.len(), 1);
         assert_eq!(b.children.len(), 1);
@@ -622,6 +661,7 @@ mod tests {
                     "/system/library/caches".into(),
                 ),
                 ("usr/local".into(), "/usr/local".into()),
+                ("Other".into(), "/users2".into()),
             ]
             .into_iter()
             .collect(),
@@ -650,6 +690,10 @@ mod tests {
         let user = ctx_for("/user");
         assert!(!is_mirror_in_scan("Users", &user));
 
+        // Canon-side boundary: "/users2" is not under "/users".
+        let users = ctx_for("/users");
+        assert!(!is_mirror_in_scan("Other", &users));
+
         // Empty table prunes nothing.
         let empty = ScanCtx {
             visited: VisitedDirs::default(),
@@ -665,26 +709,16 @@ mod tests {
     /// canonical is in the scan, `a` disappears while sibling `b` scans normally.
     #[test]
     fn firmlink_mirror_subtree_is_skipped() {
-        let base = temp_base("mirror-test");
-        std::fs::create_dir_all(base.join("a")).unwrap();
-        std::fs::create_dir_all(base.join("b")).unwrap();
-        std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
-        std::fs::write(base.join("b/file.txt"), vec![b'y'; 512]).unwrap();
-
-        let base_fd = getattrlistbulk::open_dir(&base);
-        let base_id = dir_ident(base_fd);
-        assert!(base_id.is_some());
-        getattrlistbulk::close_dir(base_fd);
-        let ctx = ScanCtx {
-            visited: VisitedDirs::default(),
-            firmlinks: [("a".into(), "/base/a".into())].into_iter().collect(),
-            data_root: base_id,
-            scan_root: "/base".into(),
-        };
+        let (base, ctx) = mirror_fixture("mirror-test", "/base/a");
+        // Direct traversal writes thread-local ext maps with no drain and
+        // runs on shared rayon workers: lock and drain so later scans
+        // see clean maps.
+        let _guard = lock_scans();
         let root_fd = getattrlistbulk::open_dir(&base);
         // The fixture root plays the Data volume: its Data-relative path is "".
         let node = build_node_fd(root_fd, "base".into(), &ctx, Some(""));
         getattrlistbulk::close_dir(root_fd);
+        drain_local_ext_maps();
 
         assert_eq!(node.children.len(), 1);
         assert_eq!(&*node.children[0].name, "b");
@@ -704,25 +738,12 @@ mod tests {
     /// the mirror is the only view, so it must be kept (no undercount).
     #[test]
     fn firmlink_mirror_kept_when_canonical_outside_scan() {
-        let base = temp_base("mirror-kept-test");
-        std::fs::create_dir_all(base.join("a")).unwrap();
-        std::fs::create_dir_all(base.join("b")).unwrap();
-        std::fs::write(base.join("a/file.txt"), vec![b'x'; 512]).unwrap();
-        std::fs::write(base.join("b/file.txt"), vec![b'y'; 512]).unwrap();
-
-        let base_fd = getattrlistbulk::open_dir(&base);
-        let base_id = dir_ident(base_fd);
-        assert!(base_id.is_some());
-        getattrlistbulk::close_dir(base_fd);
-        let ctx = ScanCtx {
-            visited: VisitedDirs::default(),
-            firmlinks: [("a".into(), "/elsewhere/a".into())].into_iter().collect(),
-            data_root: base_id,
-            scan_root: "/base".into(),
-        };
+        let (base, ctx) = mirror_fixture("mirror-kept-test", "/elsewhere/a");
+        let _guard = lock_scans();
         let root_fd = getattrlistbulk::open_dir(&base);
         let node = build_node_fd(root_fd, "base".into(), &ctx, Some(""));
         getattrlistbulk::close_dir(root_fd);
+        drain_local_ext_maps();
 
         assert_eq!(node.children.len(), 2);
         assert_eq!(node.dir_count, 3, "root + a + b");
@@ -807,7 +828,7 @@ mod tests {
     #[test]
     fn scan_of_missing_root_is_empty() {
         let missing = temp_base("missing-test").join("nope");
-        let _guard = SCAN_LOCK.lock().expect("scan lock");
+        let _guard = lock_scans();
         let tree = FileTree::scan(&missing);
         assert!(tree.root.children.is_empty());
         assert_eq!(tree.root.size, 0);
@@ -819,7 +840,7 @@ mod tests {
     /// (Unreadable content stays visible in place — never silently dropped.)
     #[test]
     fn scan_tolerates_unreadable_subdir() {
-        if unsafe { libc::getuid() } == 0 {
+        if unsafe { libc::geteuid() } == 0 {
             eprintln!("skipping unreadable-subdir test: running as root");
             return; // root reads anything; permission bit is no barrier
         }
@@ -841,21 +862,17 @@ mod tests {
         std::fs::set_permissions(&locked_path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let _restore = RestorePerms { path: &locked_path };
 
-        let _guard = SCAN_LOCK.lock().expect("scan lock");
+        let _guard = lock_scans();
         let tree = FileTree::scan(&base);
 
-        let find = |name: &str| {
-            tree.root
-                .children
-                .iter()
-                .find(|c| &*c.name == name)
-                .unwrap_or_else(|| panic!("missing child {name}"))
-        };
-        let locked = find("locked");
+        let locked = find_child(&tree.root, "locked");
         assert!(locked.is_dir && locked.children.is_empty());
-        assert_eq!(find("open").children.len(), 1);
+        assert_eq!(find_child(&tree.root, "open").children.len(), 1);
         assert_eq!(tree.root.file_count, 1, "only the readable file counts");
 
+        // Restore before removing: removal needs write access to locked/.
+        // (The RAII guard only covers panic paths from here on.)
+        std::fs::set_permissions(&locked_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -893,7 +910,7 @@ mod tests {
         std::fs::write(base.join("real/file.txt"), vec![b'x'; 512]).unwrap();
         symlink("real", base.join("linkroot")).unwrap();
 
-        let _guard = SCAN_LOCK.lock().expect("scan lock");
+        let _guard = lock_scans();
         let tree = FileTree::scan(&base.join("linkroot"));
 
         assert_eq!(tree.root.children.len(), 1);
